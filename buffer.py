@@ -46,7 +46,7 @@ class Buffer:
         for i in tqdm.tqdm(
             range(n_batches_for_norm_estimate), desc="Estimating norm scaling factor"
         ):
-            tokens = self.all_tokens[i * batch_size : (i + 1) * batch_size].long()
+            tokens = self.all_tokens[i * batch_size : (i + 1) * batch_size]
             _, cache = model.run_with_cache(
                 tokens,
                 names_filter=self.cfg["hook_point"],
