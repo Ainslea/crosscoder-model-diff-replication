@@ -24,7 +24,7 @@ default_cfg = {
     "buffer_mult": 128,
     "lr": 5e-5,
     #"num_tokens": 400_000_000,
-    "num_tokens": 400_000,
+    "num_tokens": 40_000,
     "l1_coeff": 2,
     "beta1": 0.9,
     "beta2": 0.999,
