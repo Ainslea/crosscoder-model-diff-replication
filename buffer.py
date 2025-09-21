@@ -24,7 +24,7 @@ class Buffer:
         self.token_pointer = 0
         self.first = True
         self.normalize = True
-        self.all_tokens = all_tokens.long()
+        self.all_tokens = all_tokens
         
         estimated_norm_scaling_factor_A = self.estimate_norm_scaling_factor(cfg["model_batch_size"], model_A)
         estimated_norm_scaling_factor_B = self.estimate_norm_scaling_factor(cfg["model_batch_size"], model_B)
@@ -46,7 +46,7 @@ class Buffer:
         for i in tqdm.tqdm(
             range(n_batches_for_norm_estimate), desc="Estimating norm scaling factor"
         ):
-            tokens = self.all_tokens[i * batch_size : (i + 1) * batch_size]
+            tokens = self.all_tokens[i * batch_size : (i + 1) * batch_size].long()
             _, cache = model.run_with_cache(
                 tokens,
                 names_filter=self.cfg["hook_point"],
@@ -75,7 +75,7 @@ class Buffer:
                     self.token_pointer : min(
                         self.token_pointer + self.cfg["model_batch_size"], num_batches
                     )
-                ]
+                ].long()
                 _, cache_A = self.model_A.run_with_cache(
                     tokens, names_filter=self.cfg["hook_point"]
                 )
