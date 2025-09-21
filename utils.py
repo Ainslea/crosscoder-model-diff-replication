@@ -180,17 +180,17 @@ def arg_parse_update_cfg(default_cfg):
 def load_pile_lmsys_mixed_tokens():
     try:
         print("Loading data from disk")
-        all_tokens = torch.load("/workspace/data/pile-lmsys-mix-1m-tokenized-gemma-2.pt")
+        all_tokens = torch.load("./data/pile-lmsys-mix-1m-tokenized-gemma-2.pt")
     except:
         print("Data is not cached. Loading data from HF")
         data = load_dataset(
             "ckkissane/pile-lmsys-mix-1m-tokenized-gemma-2", 
             split="train", 
-            cache_dir="/workspace/cache/"
+            cache_dir="./cache/"
         )
-        data.save_to_disk("/workspace/data/pile-lmsys-mix-1m-tokenized-gemma-2.hf")
+        data.save_to_disk("./data/pile-lmsys-mix-1m-tokenized-gemma-2.hf")
         data.set_format(type="torch", columns=["input_ids"])
         all_tokens = data["input_ids"]
-        torch.save(all_tokens, "/workspace/data/pile-lmsys-mix-1m-tokenized-gemma-2.pt")
+        torch.save(all_tokens, "./data/pile-lmsys-mix-1m-tokenized-gemma-2.pt")
         print(f"Saved tokens to disk")
     return all_tokens
