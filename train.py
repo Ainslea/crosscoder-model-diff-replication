@@ -10,7 +10,8 @@ base_model = HookedTransformer.from_pretrained(
 )
 
 chat_model = HookedTransformer.from_pretrained(
-    "gemma-2-2b-it", 
+    # "gemma-2-2b-it", 
+    "gemma-2-9b", 
     device=device, 
 )
 
