@@ -700,71 +700,6 @@ grafting_context = {}
 
 
 
-def offline_grafting_hook(module, args, output):
-    # Gemma layers often return (hidden_states, maybe_attn)
-    original_activation = output[0] if isinstance(output, tuple) else output
-    strength = grafting_context.get("strength", 0.0)
-
-    # No grafting => just pass through
-    if strength == 0.0:
-        return output
-
-    with torch.no_grad():
-        reasoning_features_dict = grafting_context["reasoning_features_dict"]
-
-        # 1) Build a 2B-IT SAE feature vector (teacher feature vec)
-        f_B_reasoning = torch.zeros(
-            1,
-            sae_b.cfg.d_sae,
-            device=original_activation.device,
-            dtype=original_activation.dtype,   # match model dtype (bfloat16)
-        )
-
-        feature_ids = list(reasoning_features_dict.keys())
-        feature_values = torch.tensor(
-            list(reasoning_features_dict.values()),
-            device=original_activation.device,
-            dtype=f_B_reasoning.dtype,         # match destination dtype
-        )
-        f_B_reasoning[:, feature_ids] = feature_values
-
-        # 2) IT -> base in SAE space using the stitch
-        f_A_grafted = stitch_model.forward_down(f_B_reasoning, use_dropout=False)
-
-        # 3) Decode back into base residual stream space
-        h_A_grafted_unnorm = sae_a.decode(f_A_grafted)
-
-        # layer-norm the grafted activation
-        h_A_grafted_norm = F.layer_norm(
-            h_A_grafted_unnorm,
-            [h_A_grafted_unnorm.shape[-1]],
-        )
-
-        # 4) Ensure same dtype/device as original residual stream
-        h_A_grafted_norm = h_A_grafted_norm.to(
-            dtype=original_activation.dtype,
-            device=original_activation.device,
-        )
-
-        # 5) Mix original + grafted activations
-        modified_activation = (
-            (1.0 - strength) * original_activation
-            + strength * h_A_grafted_norm
-        )
-
-        # Extra safety: force dtype to original
-        modified_activation = modified_activation.to(dtype=original_activation.dtype)
-
-    # Preserve tuple structure if the layer returned a tuple
-    if isinstance(output, tuple):
-        return (modified_activation,) + output[1:]
-    else:
-        return modified_activation
-
-
-
-
-
 def evaluate_gsm8k(model, tokenizer, samples, strength=0.0):
     correct, total = 0, 0
     hook_handle = target_layer.register_forward_hook(offline_grafting_hook)
@@ -813,6 +748,75 @@ def evaluate_gsm8k(model, tokenizer, samples, strength=0.0):
     print(f"-> Strength {strength}: Accuracy = {accuracy:.3f} ({correct}/{total})")
     return accuracy
 
+
+grafting_context = {}
+
+def offline_grafting_hook(module, args, output):
+    # Gemma decoder layers return (hidden_states, maybe_attn, ...)
+    original_activation = output[0] if isinstance(output, tuple) else output
+    strength = grafting_context.get("strength", 0.0)
+
+    # No grafting => pass through
+    if strength == 0.0:
+        return output
+
+    with torch.no_grad():
+        reasoning_features_dict = grafting_context["reasoning_features_dict"]
+
+        # ---- 1) Build teacher feature vector in FLOAT32 SAE space ----
+        # SAE + stitch were trained in float32, so keep that here.
+        f_B_reasoning = torch.zeros(
+          1,
+          sae_b.cfg.d_sae,
+          device=original_activation.device,
+          dtype=torch.float32,          # <- IMPORTANT: float32, not original_activation.dtype
+        )
+
+        feature_ids = list(reasoning_features_dict.keys())
+        feature_values = torch.tensor(
+          [reasoning_features_dict[fid] for fid in feature_ids],
+          device=original_activation.device,
+          dtype=torch.float32,          # <- match f_B_reasoning / stitch weights
+        )
+        f_B_reasoning[:, feature_ids] = feature_values
+
+        # (Optional but safe) ensure these live in float32
+        sae_a.float()
+        sae_b.float()
+        stitch_model.float()
+
+        # ---- 2) IT -> base in SAE space using the stitch ----
+        f_A_grafted = stitch_model.forward_down(f_B_reasoning, use_dropout=False)  # float32
+
+        # ---- 3) Decode into base residual stream space (still float32) ----
+        h_A_grafted_unnorm = sae_a.decode(f_A_grafted)  # [1, d_model] float32
+
+        # layer-norm the grafted activation (float32)
+        h_A_grafted_norm = F.layer_norm(
+            h_A_grafted_unnorm,
+            [h_A_grafted_unnorm.shape[-1]],
+        )
+
+        # ---- 4) Now convert grafted activations to match model residual dtype ----
+        h_A_grafted_norm = h_A_grafted_norm.to(
+            dtype=original_activation.dtype,   # bfloat16
+            device=original_activation.device,
+        )
+
+        # ---- 5) Mix original + grafted activations ----
+        modified_activation = (
+            (1.0 - strength) * original_activation
+            + strength * h_A_grafted_norm
+        )
+
+        # Extra safety: enforce dtype match
+        modified_activation = modified_activation.to(dtype=original_activation.dtype)
+
+    # Preserve original output structure (tuple vs tensor)
+    if isinstance(output, tuple):
+        return (modified_activation,) + output[1:]
+    else:
+        return modified_activation
 
 
 # Much faster settings
