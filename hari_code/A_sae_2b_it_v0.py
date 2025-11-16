@@ -708,23 +708,34 @@ def offline_grafting_hook(module, args, output):
 
     with torch.no_grad():
         reasoning_features_dict = grafting_context["reasoning_features_dict"]
+
+        # create 2B-IT SAE feature vector
         f_B_reasoning = torch.zeros(1, sae_b.cfg.d_sae, device=device)
+
         feature_ids = list(reasoning_features_dict.keys())
-        feature_values = torch.tensor(list(reasoning_features_dict.values()), device=device)
+        feature_values = torch.tensor(
+            list(reasoning_features_dict.values()),
+            device=device,
+            dtype=f_B_reasoning.dtype,   # <<< IMPORTANT
+        )
+
         f_B_reasoning[:, feature_ids] = feature_values
 
         # IT -> base in SAE space
         f_A_grafted = stitch_model.forward_down(f_B_reasoning, use_dropout=False)
 
-        # decode into base residual stream
+        # decode to base residual stream
         h_A_grafted_unnorm = sae_a.decode(f_A_grafted)
+        h_A_grafted_norm = F.layer_norm(
+            h_A_grafted_unnorm, [h_A_grafted_unnorm.shape[-1]]
+        )
 
-        # layer-normalize before mixing into residual stream
-        h_A_grafted_norm = F.layer_norm(h_A_grafted_unnorm, [h_A_grafted_unnorm.shape[-1]])
-
-        modified_activation = (1 - strength) * original_activation + strength * h_A_grafted_norm
+        modified_activation = (
+            (1 - strength) * original_activation + strength * h_A_grafted_norm
+        )
 
     return (modified_activation,) + output[1:] if isinstance(output, tuple) else modified_activation
+
 
 
 
