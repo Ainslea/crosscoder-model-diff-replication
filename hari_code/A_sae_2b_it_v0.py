@@ -701,40 +701,66 @@ grafting_context = {}
 
 
 def offline_grafting_hook(module, args, output):
+    # Gemma layers often return (hidden_states, maybe_attn)
     original_activation = output[0] if isinstance(output, tuple) else output
     strength = grafting_context.get("strength", 0.0)
+
+    # No grafting => just pass through
     if strength == 0.0:
         return output
 
     with torch.no_grad():
         reasoning_features_dict = grafting_context["reasoning_features_dict"]
 
-        # create 2B-IT SAE feature vector
-        f_B_reasoning = torch.zeros(1, sae_b.cfg.d_sae, device=device)
+        # 1) Build a 2B-IT SAE feature vector (teacher feature vec)
+        f_B_reasoning = torch.zeros(
+            1,
+            sae_b.cfg.d_sae,
+            device=original_activation.device,
+            dtype=original_activation.dtype,   # match model dtype (bfloat16)
+        )
 
         feature_ids = list(reasoning_features_dict.keys())
         feature_values = torch.tensor(
             list(reasoning_features_dict.values()),
-            device=device,
-            dtype=f_B_reasoning.dtype,   # <<< IMPORTANT
+            device=original_activation.device,
+            dtype=f_B_reasoning.dtype,         # match destination dtype
         )
-
         f_B_reasoning[:, feature_ids] = feature_values
 
-        # IT -> base in SAE space
+        # 2) IT -> base in SAE space using the stitch
         f_A_grafted = stitch_model.forward_down(f_B_reasoning, use_dropout=False)
 
-        # decode to base residual stream
+        # 3) Decode back into base residual stream space
         h_A_grafted_unnorm = sae_a.decode(f_A_grafted)
+
+        # layer-norm the grafted activation
         h_A_grafted_norm = F.layer_norm(
-            h_A_grafted_unnorm, [h_A_grafted_unnorm.shape[-1]]
+            h_A_grafted_unnorm,
+            [h_A_grafted_unnorm.shape[-1]],
         )
 
+        # 4) Ensure same dtype/device as original residual stream
+        h_A_grafted_norm = h_A_grafted_norm.to(
+            dtype=original_activation.dtype,
+            device=original_activation.device,
+        )
+
+        # 5) Mix original + grafted activations
         modified_activation = (
-            (1 - strength) * original_activation + strength * h_A_grafted_norm
+            (1.0 - strength) * original_activation
+            + strength * h_A_grafted_norm
         )
 
-    return (modified_activation,) + output[1:] if isinstance(output, tuple) else modified_activation
+        # Extra safety: force dtype to original
+        modified_activation = modified_activation.to(dtype=original_activation.dtype)
+
+    # Preserve tuple structure if the layer returned a tuple
+    if isinstance(output, tuple):
+        return (modified_activation,) + output[1:]
+    else:
+        return modified_activation
+
 
 
 
