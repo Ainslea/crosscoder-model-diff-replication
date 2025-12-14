@@ -1,5 +1,5 @@
-#!pip install sae-lens
-#!pip install transformers bitsandbytes accelerate datasets tqdm matplotlib seaborn statsmodels
+!pip install sae-lens
+!pip install transformers bitsandbytes accelerate datasets tqdm matplotlib seaborn statsmodels
 
 import torch
 import torch.nn as nn
@@ -14,6 +14,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import os, json, re
 from collections import defaultdict
+
 from scipy.stats import pearsonr
 from sklearn.metrics import r2_score
 from statsmodels.stats.contingency_tables import mcnemar
@@ -41,20 +42,18 @@ SAE_B_ID = f"layer_{STITCH_LAYER_B}/width_16k/canonical"
 DATASET_NAME = "NeelNanda/openwebtext-tokenized-9b"
 CONTEXT_LENGTH = 128
 BATCH_SIZE = 32
-
-# KL-based stitch training config
-NUM_EPOCHS = 1                    # effectively controls LR schedule only
+NUM_EPOCHS = 8
 LEARNING_RATE = 1e-4
-OPENWEBTEXT_TRAIN_STEPS = 500     # [REVISION(2)] number of KL steps on OWT
-
+ACTIVATION_CACHE_SIZE = 50_000       # number of sequences to cache for training
 NUM_SAMPLES_FOR_SVCCA = 200
 
-# GSM8K config
+# GSM8K config (base values)
 GSM8K_FEATURE_SAMPLES = 100
-GSM8K_EVAL_SAMPLES = 500
+GSM8K_EVAL_SAMPLES = 1000
 NUM_TOP_FEATURES = 50
 
-# Grafting strengths to sweep
+# Smaller strengths – we’ll try mild nudges
+# GRAFTING_STRENGTHS = [0.0, 0.05, 0.1, 0.2]
 GRAFTING_STRENGTHS = [0.0, 1e-2, 2e-2, 3e-2, 4e-2, 5e-2, 6e-2, 7e-2, 1e-1, 2e-1, 3e-1]
 MAX_NEW_TOKENS = 400
 EVAL_BATCH_SIZE = 8
@@ -65,10 +64,10 @@ EVALUATION_QUESTIONS_FILE = "gsm8k_eval_samples_2b_2bit.json"
 TARGET_SAE_NORM = 10.0
 
 # --------------------
-# Hugging Face login
+# Hugging Face login (replace token string or use hf-cli)
 # --------------------
 from huggingface_hub import login
-login(token="XXX")  # <--- REPLACE WITH YOUR TOKEN OR USE CLI
+login(token='xxx')  # <--- REPLACE WITH YOUR TOKEN OR USE CLI
 
 # --------------------
 # Load tokenizer and models
@@ -84,7 +83,7 @@ model_a = AutoModelForCausalLM.from_pretrained(
     MODEL_A_ID,
     torch_dtype=torch.bfloat16,
     device_map="auto",
-    low_cpu_mem_usage=True,
+    low_cpu_mem_usage=True
 )
 
 print(f"Loading {MODEL_B_ID} (2B-IT)...")
@@ -92,15 +91,11 @@ model_b = AutoModelForCausalLM.from_pretrained(
     MODEL_B_ID,
     torch_dtype=torch.bfloat16,
     device_map="auto",
-    low_cpu_mem_usage=True,
+    low_cpu_mem_usage=True
 )
 
 print("Models and tokenizer loaded successfully.")
 print(f"Using fixed layer pair: 2B base Layer {STITCH_LAYER_A} ↔ 2B-IT Layer {STITCH_LAYER_B}")
-
-# We’ll often need the underlying transformer stack
-base_stack_a = model_a.model
-base_stack_b = model_b.model
 
 # --------------------
 # Helper functions
@@ -139,6 +134,17 @@ def get_normalized_activations(model, tokens, layer_idx, return_all_positions=Fa
             normalized = torch.nn.functional.layer_norm(last_token_acts, [last_token_acts.shape[-1]])
             return normalized.cpu()
 
+def get_sae_features(model, sae, tokens, layer_idx):
+    """SAE features for last token"""
+    with torch.no_grad():
+        if hasattr(model, "model"):
+            outputs = model.model(tokens, output_hidden_states=True)
+        else:
+            outputs = model(tokens, output_hidden_states=True)
+        activations = outputs.hidden_states[layer_idx].to(torch.float32)
+        features = sae.encode(activations[:, -1])
+        return features.cpu()
+
 def centered_kernel_alignment(acts_a, acts_b, device):
     acts_a = acts_a.to(device)
     acts_b = acts_b.to(device)
@@ -168,10 +174,6 @@ def centered_kernel_alignment(acts_a, acts_b, device):
     return abs(cka_score)
 
 class EnhancedStitch(nn.Module):
-    """
-    Simple SAE-space stitch: A_SAE <-> B_SAE via 2 linear layers.
-    We train it functionally (KL on logits) rather than pure L2 on features.
-    """
     def __init__(self, dim_a, dim_b, dropout_rate=0.1):
         super().__init__()
         self.up = nn.Linear(dim_a, dim_b)
@@ -194,6 +196,17 @@ class EnhancedStitch(nn.Module):
         if use_dropout and self.training:
             x = self.dropout(x)
         return x
+
+class ActivationDataset(Dataset):
+    def __init__(self, acts_a_tensor, acts_b_tensor):
+        self.acts_a = acts_a_tensor
+        self.acts_b = acts_b_tensor
+
+    def __len__(self):
+        return self.acts_a.shape[0]
+
+    def __getitem__(self, idx):
+        return self.acts_a[idx], self.acts_b[idx]
 
 # --------------------
 # Load SAEs
@@ -218,9 +231,9 @@ except Exception as e:
     sae_a, sae_b = None, None
     raise RuntimeError("SAEs are required for this experiment")
 
-# --------------------
-# CKA VERIFICATION
-# --------------------
+# ================================
+# 1. CKA VERIFICATION (ACTIVATION SPACE)
+# ================================
 print(f"\nUsing fixed layer pair: 2B base Layer {STITCH_LAYER_A} ↔ 2B-IT Layer {STITCH_LAYER_B}")
 print("Verifying layer pair with CKA similarity...")
 print("Preparing small dataset for verification...")
@@ -269,9 +282,61 @@ if len(all_acts_a) > 0:
 else:
     print("Could not compute verification - proceeding anyway")
 
-# --------------------
-# Initialize stitch in SAE space
-# --------------------
+# Reduce cache a bit for practicality if you like
+ACTIVATION_CACHE_SIZE = 10_000
+
+# ================================
+# 2. SAE FEATURE CACHING (LAST TOKEN)
+# ================================
+print("\nCaching SAE features for stitch training...")
+train_dataset = load_dataset(
+    DATASET_NAME, split="train", streaming=True
+).take(ACTIVATION_CACHE_SIZE)
+
+features_a_list, features_b_list = [], []
+processed_count = 0
+
+for item in tqdm(train_dataset, desc="Caching SAE features"):
+    try:
+        tokens = torch.tensor(item["tokens"])[:CONTEXT_LENGTH]
+        if len(tokens) < CONTEXT_LENGTH:
+            tokens = torch.cat(
+                [tokens, torch.full((CONTEXT_LENGTH - len(tokens),), tokenizer.pad_token_id)]
+            )
+        tokens = tokens.to(device).unsqueeze(0)
+
+        feats_a = get_sae_features(model_a, sae_a, tokens, STITCH_LAYER_A)  # [1, d_sae_a]
+        feats_b = get_sae_features(model_b, sae_b, tokens, STITCH_LAYER_B)  # [1, d_sae_b]
+
+        features_a_list.append(feats_a.squeeze(0))
+        features_b_list.append(feats_b.squeeze(0))
+
+        processed_count += 1
+        if processed_count % 100 == 0:
+            torch.cuda.empty_cache()
+            print(f"Cached {processed_count} sequences")
+
+    except Exception as e:
+        print(f"Error caching features: {e}")
+        continue
+
+print(f"Successfully cached {len(features_a_list)} SAE feature pairs")
+torch.cuda.empty_cache()
+
+cached_features_a_tensor = torch.stack(features_a_list, dim=0).to(torch.bfloat16)
+cached_features_b_tensor = torch.stack(features_b_list, dim=0).to(torch.bfloat16)
+
+print(
+    f"Final training data shape (SAE space): "
+    f"A={cached_features_a_tensor.shape}, B={cached_features_b_tensor.shape}"
+)
+
+activation_dataset = ActivationDataset(cached_features_a_tensor, cached_features_b_tensor)
+dataloader = DataLoader(activation_dataset, batch_size=BATCH_SIZE, shuffle=True)
+
+# ================================
+# 3. STITCH INITIALIZATION (SAE SPACE)
+# ================================
 dim_a = sae_a.cfg.d_sae   # e.g. 16384
 dim_b = sae_b.cfg.d_sae   # e.g. 16384
 
@@ -279,220 +344,244 @@ stitch_model = EnhancedStitch(dim_a, dim_b, dropout_rate=0.1).to(device)
 optimizer = torch.optim.AdamW(stitch_model.parameters(), lr=LEARNING_RATE, weight_decay=1e-5)
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS)
 
+def sae_loss_fn(pred_features, target_features, l1_weight=0.001):
+    mse = F.mse_loss(pred_features, target_features)
+    l1 = torch.abs(pred_features).mean()
+
+    active_mask = (torch.abs(target_features) > 0.1).float()
+    active_mse = (
+        active_mask * (pred_features - target_features) ** 2
+    ).sum() / (active_mask.sum() + 1e-8)
+
+    false_negative = (active_mask * (1 - torch.sigmoid(pred_features * 10))).mean()
+
+    return mse + (l1_weight * l1) + 0.3 * active_mse + 0.1 * false_negative
+
 print(f"\nEnhanced Stitch Architecture (SAE space): {dim_a} -> {dim_b}")
-print("Training objective: KL(Teacher logits || Student+Stitch logits) [REVISION(2)]")
-print(f"Using up to {OPENWEBTEXT_TRAIN_STEPS} training steps from OpenWebText")
+print(f"Training data: {cached_features_a_tensor.shape[0]:,} SAE feature pairs")
+print(f"Training for {NUM_EPOCHS} epochs with {len(dataloader)} batches per epoch")
+print("Starting stitch training...")
 
-# --------------------
-# Grafting context + hooks
-# --------------------
-grafting_context = {}
-target_layer = base_stack_a.layers[STITCH_LAYER_A]  # student layer to graft into
-
-# [REVISION(3)] Training-time grafting hook (additive)
-def training_grafting_hook(module, args, output):
-    """
-    Forward hook used *only during KL-training* of the stitch.
-
-    Uses teacher SAE features from grafting_context["teacher_features_train"]
-    and applies an ADDITIVE intervention to the student's last-token residual
-    at STITCH_LAYER_A:
-
-        r_student_last <- r_student_last + alpha * graft
-
-    where alpha = grafting_context["train_strength"] (typically 1.0).
-    """
-    original_activation = output[0] if isinstance(output, tuple) else output  # [B, T, D]
-    strength = grafting_context.get("train_strength", 1.0)
-
-    if strength == 0.0 or "teacher_features_train" not in grafting_context:
-        return output
-
-    with torch.no_grad():
-        device_local = original_activation.device
-
-        # Teacher SAE features for this batch (B, d_sae_B)
-        teacher_sae = grafting_context["teacher_features_train"].to(device_local)
-
-        # Dtypes
-        stitch_weight_dtype = stitch_model.down.weight.dtype     # usually float32
-        sae_a_dtype = next(sae_a.parameters()).dtype             # usually float32
-        resid_dtype = original_activation.dtype                  # e.g. bfloat16
-
-        # 1) Ensure teacher SAE uses stitch dtype
-        f_B = teacher_sae.to(dtype=stitch_weight_dtype)
-
-        # 2) Map B -> A in SAE space (teacher -> student SAE space)
-        f_A = stitch_model.forward_down(f_B, use_dropout=False)  # [B, d_sae_A], float32
-
-        # 3) Decode back into student residual space via SAE-A
-        h_A_unnorm = sae_a.decode(f_A.to(sae_a_dtype))           # [B, D_model]
-
-        # 4) LayerNorm in SAE-A dtype, then cast to residual dtype/device
-        h_A_norm = F.layer_norm(h_A_unnorm, [h_A_unnorm.shape[-1]])
-
-        # Important: cast in two steps to avoid .to() signature issues
-        h_A_norm = h_A_norm.to(device_local)
-        h_A_norm = h_A_norm.to(resid_dtype)
-
-        # 5) ADDITIVE graft ONLY on last token  [REVISION(3)]
-        B, T, D = original_activation.shape
-        modified_activation = original_activation.clone()
-
-        last_orig = original_activation[:, -1, :]               # [B, D]
-        last_grafted = last_orig + strength * h_A_norm          # ADDITIVE intervention
-        modified_activation[:, -1, :] = last_grafted
-
-    if isinstance(output, tuple):
-        return (modified_activation,) + output[1:]
-    else:
-        return modified_activation
-
-# --------------------
-# KL-based stitch training step [REVISION(2)]
-# --------------------
-def kl_train_step(batch_items):
-    """
-    One training step on a small batch of OpenWebText tokens.
-    Objective: minimize KL(Teacher || Student+Stitch).
-
-    Robust to teacher outputs that come back as BaseModelOutputWithPast by
-    reconstructing logits via lm_head if needed.
-    """
-    # Build tensor batch
-    batch_tokens = []
-    for item in batch_items:
-        tokens = torch.tensor(item["tokens"])[:CONTEXT_LENGTH]
-        if len(tokens) < CONTEXT_LENGTH:
-            tokens = torch.cat(
-                [tokens, torch.full((CONTEXT_LENGTH - len(tokens),), tokenizer.pad_token_id)]
-            )
-        batch_tokens.append(tokens)
-
-    input_ids = torch.stack(batch_tokens, dim=0).to(device)  # [B, T]
-    attention_mask = (input_ids != tokenizer.pad_token_id).long().to(device)
-
-    # 1) Teacher forward (CausalLM) with hidden states
-    with torch.no_grad():
-        outputs_teacher = model_b(
-            input_ids,
-            attention_mask=attention_mask,
-            output_hidden_states=True,
-            return_dict=True,
-        )
-
-        # Get logits robustly
-        if hasattr(outputs_teacher, "logits") and outputs_teacher.logits is not None:
-            teacher_logits = outputs_teacher.logits  # [B, T, V]
-        else:
-            # Fallback: compute logits from last_hidden_state via lm_head
-            if hasattr(outputs_teacher, "last_hidden_state"):
-                hidden_for_logits = outputs_teacher.last_hidden_state  # [B, T, D]
-            else:
-                hidden_for_logits = outputs_teacher.hidden_states[-1]
-            teacher_logits = model_b.lm_head(hidden_for_logits)
-
-        # Hidden states at stitch layer for SAE-B
-        if outputs_teacher.hidden_states is not None:
-            teacher_hidden = outputs_teacher.hidden_states[STITCH_LAYER_B]  # [B, T, D_model]
-        else:
-            base_out = base_stack_b(
-                input_ids,
-                attention_mask=attention_mask,
-                output_hidden_states=True,
-                return_dict=True,
-            )
-            teacher_hidden = base_out.hidden_states[STITCH_LAYER_B]
-
-        # Average teacher hidden across non-pad tokens for SAE-B encoding
-        attn = attention_mask.unsqueeze(-1)  # [B, T, 1]
-        masked = teacher_hidden * attn
-        lengths = attn.squeeze(-1).sum(dim=1, keepdim=True)  # [B, 1]
-        lengths = torch.clamp(lengths, min=1.0)
-        avg_act = masked.sum(dim=1) / lengths  # [B, D_model]
-
-        teacher_sae = sae_b.encode(avg_act.to(torch.float32))  # [B, d_sae_B], float32
-
-    # Store teacher SAE features for training hook
-    grafting_context["teacher_features_train"] = teacher_sae.detach()
-    grafting_context["train_strength"] = 1.0  # strong internal signal; external sweep is separate
-
-    # 2) Student forward + graft (CausalLM)
-    outputs_student = model_a(
-        input_ids,
-        attention_mask=attention_mask,
-        output_hidden_states=False,
-        return_dict=True,
-    )
-    student_logits = outputs_student.logits  # [B, T, V]
-
-    # 3) KL(Teacher || Student+Stitch) across non-pad tokens
-    teacher_logits_use = teacher_logits[:, :-1, :]        # [B, T-1, V]
-    student_logits_use = student_logits[:, :-1, :]
-    mask = attention_mask[:, 1:].unsqueeze(-1)           # [B, T-1, 1]
-
-    teacher_log_probs = F.log_softmax(teacher_logits_use.float(), dim=-1)
-    student_log_probs = F.log_softmax(student_logits_use.float(), dim=-1)
-    teacher_probs = teacher_log_probs.exp()
-
-    kl_per_token_vocab = F.kl_div(
-        student_log_probs, teacher_probs, reduction="none"
-    )  # [B, T-1, V]
-    kl_per_token = kl_per_token_vocab.sum(dim=-1)  # [B, T-1]
-
-    masked_kl = kl_per_token * mask.squeeze(-1)
-    loss = masked_kl.sum() / (mask.sum() + 1e-8)
-
-    return loss
-
-# --------------------
-# Run KL-based stitch training
-# --------------------
-print("\nStarting functional stitch training (KL-based)... [REVISION(2)]")
-
-# Clear any existing hooks and attach training hook
-try:
-    target_layer._forward_hooks.clear()
-    target_layer._forward_pre_hooks.clear()
-except Exception as e:
-    print("Warning while clearing hooks:", e)
-
-train_hook_handle = target_layer.register_forward_hook(training_grafting_hook)
-
-openwebtext_stream = load_dataset(
-    DATASET_NAME, split="train", streaming=True
-).take(OPENWEBTEXT_TRAIN_STEPS * BATCH_SIZE)
-
-batch = []
-step = 0
+# ================================
+# 4. TRAINING LOOP (SAE FEATURES)
+# ================================
+stitch_model.train()
 loss_history = []
+epoch_losses = []
 
-for item in openwebtext_stream:
-    batch.append(item)
-    if len(batch) == BATCH_SIZE:
-        batch_items = batch
-        batch = []
+for epoch in range(NUM_EPOCHS):
+    total_loss = 0.0
+    total_up_loss = 0.0
+    total_down_loss = 0.0
+    total_cycle_loss = 0.0
 
-        stitch_model.train()
+    progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS}")
+
+    for batch_idx, (f_a, f_b) in enumerate(progress_bar):
+        f_a = f_a.to(device, dtype=torch.float32)
+        f_b = f_b.to(device, dtype=torch.float32)
+
         optimizer.zero_grad()
-        loss = kl_train_step(batch_items)
+
+        f_a_to_b = stitch_model.forward_up(f_a)      # base -> IT
+        f_b_to_a = stitch_model.forward_down(f_b)    # IT   -> base (grafting direction)
+
+        f_a_cycle = stitch_model.forward_down(f_a_to_b, use_dropout=False)
+        f_b_cycle = stitch_model.forward_up(f_b_to_a, use_dropout=False)
+
+        up_loss = sae_loss_fn(f_a_to_b, f_b)
+        down_loss = sae_loss_fn(f_b_to_a, f_a)
+        cycle_a_loss = sae_loss_fn(f_a_cycle, f_a)
+        cycle_b_loss = sae_loss_fn(f_b_cycle, f_b)
+
+        loss = up_loss + 1.2 * down_loss + 0.5 * (cycle_a_loss + cycle_b_loss)
+
         loss.backward()
         torch.nn.utils.clip_grad_norm_(stitch_model.parameters(), max_norm=1.0)
         optimizer.step()
-        scheduler.step()
 
-        step += 1
-        loss_history.append(loss.item())
-        if step % 10 == 0:
-            print(f"[KL step {step}] loss = {loss.item():.4f}")
-        if step >= OPENWEBTEXT_TRAIN_STEPS:
-            break
+        total_loss += loss.item()
+        total_up_loss += up_loss.item()
+        total_down_loss += down_loss.item()
+        total_cycle_loss += (cycle_a_loss.item() + cycle_b_loss.item())
 
-train_hook_handle.remove()
-print("KL-based stitch training complete.\n")
+        progress_bar.set_postfix(
+            {
+                "Loss": f"{loss.item():.4f}",
+                "Base->IT": f"{up_loss.item():.4f}",
+                "IT->Base": f"{down_loss.item():.4f}",
+                "LR": f"{scheduler.get_last_lr()[0]:.2e}",
+            }
+        )
+
+        if batch_idx % 100 == 0:
+            loss_history.append(loss.item())
+
+    avg_loss = total_loss / len(dataloader)
+    avg_up_loss = total_up_loss / len(dataloader)
+    avg_down_loss = total_down_loss / len(dataloader)
+    avg_cycle_loss = total_cycle_loss / len(dataloader)
+
+    epoch_losses.append(avg_loss)
+    scheduler.step()
+
+    print(f"\nEpoch {epoch+1} Summary:")
+    print(f"  Total Loss:       {avg_loss:.4f}")
+    print(f"  Base->IT Loss:    {avg_up_loss:.4f}")
+    print(f"  IT->Base Loss:    {avg_down_loss:.4f} (grafting direction)")
+    print(f"  Cycle Loss (sum): {avg_cycle_loss:.4f}")
+    print(f"  Learning Rate:    {scheduler.get_last_lr()[0]:.2e}")
+
+print("Stitch training complete in SAE space!")
 
 # ================================
-# 6. GSM8K REASONING + DYNAMIC GRAFTING
+# 5. PLOT TRAINING CURVES
+# ================================
+plt.figure(figsize=(12, 4))
+
+plt.subplot(1, 2, 1)
+plt.plot(loss_history, alpha=0.7, label="Batch Loss")
+plt.title("Training Loss (Per Batch)")
+plt.xlabel("Batch")
+plt.ylabel("Loss")
+plt.legend()
+plt.grid(True, alpha=0.3)
+
+plt.subplot(1, 2, 2)
+plt.plot(epoch_losses, "o-", linewidth=2, markersize=6)
+plt.title("Average Loss Per Epoch")
+plt.xlabel("Epoch")
+plt.ylabel("Average Loss")
+plt.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.savefig(f"stitch_training_curves_SAE_2B-2B-IT_L{STITCH_LAYER_A}.png", dpi=150, bbox_inches="tight")
+plt.show()
+
+# ================================
+# 6. SAE-SPACE EVALUATION (OpenWebText)
+# ================================
+print("\nEvaluating stitch quality in SAE space on held-out samples...")
+
+test_samples = []
+test_dataset = (
+    load_dataset(DATASET_NAME, split="train", streaming=True)
+    .skip(ACTIVATION_CACHE_SIZE // 4)
+    .take(10)
+)
+
+for item in test_dataset:
+    test_tokens = torch.tensor(item["tokens"])[:CONTEXT_LENGTH]
+    if len(test_tokens) < CONTEXT_LENGTH:
+        test_tokens = torch.cat(
+            [test_tokens, torch.full((CONTEXT_LENGTH - len(test_tokens),), tokenizer.pad_token_id)]
+        )
+    test_samples.append(test_tokens.to(device).unsqueeze(0))
+
+all_transfer_losses = []
+all_random_losses = []
+all_reverse_losses = []
+all_feature_preservation_scores = []
+
+stitch_model.eval()
+model_a.eval()
+model_b.eval()
+sae_a.eval()
+sae_b.eval()
+
+for i, test_tokens in enumerate(test_samples):
+    print(f"\nTest Sample {i+1}")
+    try:
+        with torch.no_grad():
+            if hasattr(model_a, "model"):
+                outputs_a = model_a.model(test_tokens, output_hidden_states=True)
+            else:
+                outputs_a = model_a(test_tokens, output_hidden_states=True)
+            acts_a = outputs_a.hidden_states[STITCH_LAYER_A]
+
+            if hasattr(model_b, "model"):
+                outputs_b = model_b.model(test_tokens, output_hidden_states=True)
+            else:
+                outputs_b = model_b(test_tokens, output_hidden_states=True)
+            acts_b = outputs_b.hidden_states[STITCH_LAYER_B]
+
+            features_a_all = sae_a.encode(acts_a.squeeze(0))
+            features_b_all = sae_b.encode(acts_b.squeeze(0))
+
+    except Exception as e:
+        print(f"Error: {e}")
+        continue
+
+    seq_len = features_a_all.shape[0]
+    eval_positions = [0, seq_len // 2, seq_len - 1] if seq_len > 1 else [0]
+
+    position_metrics = {
+        "transfer": [],
+        "reverse": [],
+        "random": [],
+        "feature_preservation": [],
+    }
+
+    for pos_idx in eval_positions:
+        f_a = features_a_all[pos_idx].to(device)
+        f_b = features_b_all[pos_idx].to(device)
+
+        with torch.no_grad():
+            f_a_to_b = stitch_model.forward_up(f_a, use_dropout=False)   # base->IT
+            transfer_loss = F.mse_loss(f_a_to_b, f_b).item()
+
+            f_b_to_a = stitch_model.forward_down(f_b, use_dropout=False) # IT->base
+            reverse_loss = F.mse_loss(f_b_to_a, f_a).item()
+
+            random_projection = nn.Linear(dim_b, dim_a).to(device)
+            f_b_random = random_projection(f_b)
+            random_loss = F.mse_loss(f_b_random, f_a).item()
+
+            active_b = (torch.abs(f_b) > 0.1).float()
+            active_transferred = (torch.abs(f_b_to_a) > 0.1).float()
+            preserved = (active_b * active_transferred).sum()
+            total_active_b = active_b.sum()
+            preservation_rate = (preserved / total_active_b).item() if total_active_b > 0 else 0.0
+
+            position_metrics["transfer"].append(transfer_loss)
+            position_metrics["reverse"].append(reverse_loss)
+            position_metrics["random"].append(random_loss)
+            position_metrics["feature_preservation"].append(preservation_rate)
+
+    avg_transfer = np.mean(position_metrics["transfer"])
+    avg_reverse = np.mean(position_metrics["reverse"])
+    avg_random = np.mean(position_metrics["random"])
+    avg_preservation = np.mean(position_metrics["feature_preservation"])
+
+    all_transfer_losses.append(avg_transfer)
+    all_reverse_losses.append(avg_reverse)
+    all_random_losses.append(avg_random)
+    all_feature_preservation_scores.append(avg_preservation)
+
+    print(f"  Base->IT Transfer MSE: {avg_transfer:.4f}")
+    print(f"  IT->Base Transfer MSE: {avg_reverse:.4f} ← Grafting direction")
+    print(f"  Random Baseline MSE:   {avg_random:.4f}")
+    print(f"  Feature Preservation:  {avg_preservation:.2%}")
+
+print("\n" + "="*60)
+print("FINAL RESULTS (SAE Feature Space Transfer: 2B base ↔ 2B-IT)")
+print("="*60)
+print(f"Average Base->IT Transfer MSE:   {np.mean(all_transfer_losses):.4f}")
+print(f"Average IT->Base Transfer MSE:   {np.mean(all_reverse_losses):.4f}")
+print(f"Average Random Baseline MSE:     {np.mean(all_random_losses):.4f}")
+print(f"Average Feature Preservation:    {np.mean(all_feature_preservation_scores):.2%}")
+print("-" * 60)
+
+up_improvement = np.mean(all_random_losses) / np.mean(all_transfer_losses)
+down_improvement = np.mean(all_random_losses) / np.mean(all_reverse_losses)
+print(f"Base->IT Improvement:            {up_improvement:.2f}x over random")
+print(f"IT->Base Improvement:            {down_improvement:.2f}x over random")
+print("="*60)
+
+
+
+# ================================
+# 7. GSM8K REASONING + DYNAMIC GRAFTING
 # ================================
 def extract_numerical_answer(text):
     text = text.replace(",", "")
@@ -520,13 +609,7 @@ def extract_numerical_answer(text):
             pass
     return None
 
-# [REVISION(1: still freq+magnitude, but with clear scoring)]
 def identify_reasoning_features(model_teacher, sae_teacher, tokenizer, gsm8k_samples, layer_idx):
-    """
-    Heuristic feature selection: frequency × magnitude over GSM8K prompts.
-    (Keeps original heuristic but wrapped more cleanly; ablation-based
-    scoring could be plugged in here later.)
-    """
     print(f"Identifying reasoning features using {len(gsm8k_samples)} GSM8K samples...")
     feature_activations = defaultdict(list)
     feature_frequency = defaultdict(int)
@@ -545,18 +628,16 @@ def identify_reasoning_features(model_teacher, sae_teacher, tokenizer, gsm8k_sam
 
         try:
             with torch.no_grad():
-                outputs = model_teacher.model(
-                    inputs["input_ids"],
-                    attention_mask=inputs["attention_mask"],
-                    output_hidden_states=True,
-                    return_dict=True,
-                )
+                if hasattr(model_teacher, "model"):
+                    outputs = model_teacher.model(inputs["input_ids"], output_hidden_states=True)
+                else:
+                    outputs = model_teacher(inputs["input_ids"], output_hidden_states=True)
 
-                all_activations = outputs.hidden_states[layer_idx]  # [1, seq_len, D]
+                all_activations = outputs.hidden_states[layer_idx]  # [1, seq_len, d]
                 attention_mask = inputs["attention_mask"].unsqueeze(-1)  # [1, seq_len, 1]
                 masked_activations = all_activations * attention_mask
                 seq_len = attention_mask.sum()
-                avg_activation = masked_activations.sum(dim=1) / seq_len  # [1, D]
+                avg_activation = masked_activations.sum(dim=1) / seq_len  # [1, d]
 
                 feature_acts = sae_teacher.encode(avg_activation).squeeze(0).cpu().float()
                 feature_magnitudes = torch.abs(feature_acts)
@@ -591,7 +672,7 @@ def identify_reasoning_features(model_teacher, sae_teacher, tokenizer, gsm8k_sam
         feature_scores.keys(), key=lambda x: feature_scores[x]["score"], reverse=True
     )[:NUM_TOP_FEATURES]
 
-    print("\nTop 10 reasoning features (heuristic):")
+    print("\nTop 10 reasoning features (averaged across full sequences):")
     for i, fid in enumerate(top_features[:10]):
         info = feature_scores[fid]
         print(
@@ -602,48 +683,56 @@ def identify_reasoning_features(model_teacher, sae_teacher, tokenizer, gsm8k_sam
 
     return top_features, feature_scores
 
-# [REVISION(3)] Offline grafting hook for evaluation (additive, not convex)
+grafting_context = {}
+
 def offline_grafting_hook(module, args, output):
     """
-    Forward hook on Gemma 2B base model at STITCH_LAYER_A for GSM8K eval.
+    Forward hook on Gemma 2B base model at STITCH_LAYER_A.
 
-    Uses dynamic teacher SAE features per batch, stored in
+    Uses *dynamic* teacher SAE features per batch, stored in
     grafting_context["teacher_features"] by evaluate_gsm8k.
 
-    Grafting is applied ONLY on the last token at this layer via ADDITION:
-        r_student_last <- r_student_last + strength * graft
+    Grafting is applied ONLY on the last token at this layer.
     """
-    original_activation = output[0] if isinstance(output, tuple) else output  # [B, T, D]
+    original_activation = output[0] if isinstance(output, tuple) else output  # [B, T, D] or [B, 1, D]
     strength = grafting_context.get("strength", 0.0)
 
     if strength == 0.0 or "teacher_features" not in grafting_context:
         return output
 
     with torch.no_grad():
-        device_local = original_activation.device
+        device = original_activation.device
 
-        teacher_sae = grafting_context["teacher_features"].to(device_local)
+        teacher_sae = grafting_context["teacher_features"].to(device)
+        # Shape check: batch dimension should match
         if teacher_sae.shape[0] != original_activation.shape[0]:
-            return output  # shape mismatch safety
+            # If mismatch happens, skip graft to be safe
+            return output
 
-        stitch_weight_dtype = stitch_model.down.weight.dtype
-        sae_a_dtype = next(sae_a.parameters()).dtype
-        resid_dtype = original_activation.dtype
+        # Dtypes
+        stitch_weight_dtype = stitch_model.down.weight.dtype   # typically float32
+        sae_a_dtype = next(sae_a.parameters()).dtype           # typically float32
+        resid_dtype = original_activation.dtype                # bfloat16
 
+        # 1) Ensure teacher_sae uses stitch dtype
         f_B = teacher_sae.to(dtype=stitch_weight_dtype)
-        f_A = stitch_model.forward_down(f_B, use_dropout=False)  # [B, d_sae_A]
 
-        h_A_unnorm = sae_a.decode(f_A.to(dtype=sae_a_dtype))     # [B, D_model]
+        # 2) IT -> base in SAE space (B -> A)
+        f_A = stitch_model.forward_down(f_B, use_dropout=False)  # [B, d_sae_A], float32
 
-        h_A_norm = F.layer_norm(h_A_unnorm, [h_A_unnorm.shape[-1]])
-        h_A_norm = h_A_norm.to(device_local)
-        h_A_norm = h_A_norm.to(resid_dtype)
+        # 3) Decode into base residual space via SAE-A
+        h_A_unnorm = sae_a.decode(f_A.to(dtype=sae_a_dtype))     # [B, D_model], float32
 
+        # 4) LayerNorm in sae_a dtype, then cast to residual dtype
+        h_A_norm = F.layer_norm(h_A_unnorm, [h_A_unnorm.shape[-1]])  # [B, D_model]
+        h_A_norm = h_A_norm.to(dtype=resid_dtype, device=device)
+
+        # 5) Mix ONLY on last token
         B, T, D = original_activation.shape
         modified_activation = original_activation.clone()
 
-        last_orig = original_activation[:, -1, :]
-        last_grafted = last_orig + strength * h_A_norm
+        last_orig = original_activation[:, -1, :]          # [B, D]
+        last_grafted = (1.0 - strength) * last_orig + strength * h_A_norm
         modified_activation[:, -1, :] = last_grafted
 
     if isinstance(output, tuple):
@@ -651,7 +740,7 @@ def offline_grafting_hook(module, args, output):
     else:
         return modified_activation
 
-def evaluate_gsm8k(model, tokenizer, samples, strength=0.0, use_random_features=False):
+def evaluate_gsm8k(model, tokenizer, samples, strength=0.0):
     """
     Evaluate GSM8K with dynamic teacher-based grafting.
 
@@ -659,42 +748,27 @@ def evaluate_gsm8k(model, tokenizer, samples, strength=0.0, use_random_features=
       1) Run teacher model (2B-IT) on the *same prompts*.
       2) Get average hidden states at STITCH_LAYER_B.
       3) Encode with SAE-B -> teacher_sae [B, d_sae_B].
-      4) Keep either top-k reasoning features OR k random features.  [REVISION(4)]
+      4) Zero out all dims except reasoning feature ids.
       5) L2-normalize to TARGET_SAE_NORM.
       6) Store in grafting_context["teacher_features"].
       7) Run base model with grafting hook active.
     """
     correct, total = 0, 0
-    # Attach evaluation hook
-    eval_hook_handle = target_layer.register_forward_hook(offline_grafting_hook)
-    print(
-        f"\nEvaluating on GSM8K with grafting strength: {strength} "
-        f"({'RANDOM' if use_random_features else 'REASONING'})"
-    )
+    hook_handle = target_layer.register_forward_hook(offline_grafting_hook)
+    print(f"\nEvaluating on GSM8K with grafting strength: {strength}")
 
     model_b.eval()
     sae_b.eval()
 
     feature_ids_tensor = None
-    if not use_random_features and grafting_context.get("reasoning_features_dict", None):
+    if grafting_context.get("reasoning_features_dict", None):
         feature_ids = list(grafting_context["reasoning_features_dict"].keys())
         feature_ids_tensor = torch.tensor(feature_ids, dtype=torch.long, device=device)
-    elif use_random_features:
-        # random control: same k as reasoning features
-        k = len(grafting_context.get("reasoning_features_dict", {}))
-        if k > 0:
-            all_ids = torch.arange(sae_b.cfg.d_sae, device=device)
-            perm = torch.randperm(sae_b.cfg.d_sae, device=device)
-            feature_ids_tensor = perm[:k]
-        else:
-            feature_ids_tensor = None
 
-    for i in tqdm(range(0, len(samples), EVAL_BATCH_SIZE),
-                  desc=f"Strength {strength} ({'rand' if use_random_features else 'sel'})"):
+    for i in tqdm(range(0, len(samples), EVAL_BATCH_SIZE), desc=f"Strength {strength}"):
         batch_samples = samples[i : i + EVAL_BATCH_SIZE]
         prompts = [
-            f"Question: {s['question']}\nLet me solve this step by step:"
-            for s in batch_samples
+            f"Question: {s['question']}\nLet me solve this step by step:" for s in batch_samples
         ]
         correct_answers = [extract_numerical_answer(s["answer"]) for s in batch_samples]
         inputs = tokenizer(
@@ -705,32 +779,42 @@ def evaluate_gsm8k(model, tokenizer, samples, strength=0.0, use_random_features=
             max_length=512,
         ).to(device)
 
+        # -----------------------------
         # Compute dynamic teacher SAE features per batch
+        # -----------------------------
         with torch.no_grad():
-            outputs_teacher = model_b.model(
-                inputs["input_ids"],
-                attention_mask=inputs["attention_mask"],
-                output_hidden_states=True,
-                return_dict=True,
-            )
+            if hasattr(model_b, "model"):
+                outputs_teacher = model_b.model(
+                    inputs["input_ids"],
+                    attention_mask=inputs["attention_mask"],
+                    output_hidden_states=True,
+                )
+            else:
+                outputs_teacher = model_b(
+                    inputs["input_ids"],
+                    attention_mask=inputs["attention_mask"],
+                    output_hidden_states=True,
+                )
 
-            teacher_hidden = outputs_teacher.hidden_states[STITCH_LAYER_B]  # [B, T, D]
+            teacher_hidden = outputs_teacher.hidden_states[STITCH_LAYER_B]  # [B, T, D_model]
             attn = inputs["attention_mask"].unsqueeze(-1)                   # [B, T, 1]
+            # Average over non-pad tokens
             masked = teacher_hidden * attn
             lengths = attn.squeeze(-1).sum(dim=1, keepdim=True)             # [B, 1]
             lengths = torch.clamp(lengths, min=1.0)
-            avg_act = masked.sum(dim=1) / lengths                           # [B, D]
+            avg_act = masked.sum(dim=1) / lengths                           # [B, D_model]
 
+            # SAE-B encode
             teacher_sae = sae_b.encode(avg_act.to(torch.float32))           # [B, d_sae_B]
             teacher_sae = teacher_sae.to(torch.float32)
 
-            # Keep only selected or random feature dims (mask others to zero)
+            # Keep only reasoning feature dims (mask others to zero)
             if feature_ids_tensor is not None:
                 mask = torch.zeros_like(teacher_sae)
                 mask[:, feature_ids_tensor] = 1.0
                 teacher_sae = teacher_sae * mask
 
-            # Normalize to TARGET_SAE_NORM
+            # Normalize to TARGET_SAE_NORM to avoid huge grafts
             norms = teacher_sae.norm(dim=-1, keepdim=True)                  # [B, 1]
             target = TARGET_SAE_NORM
             teacher_sae = torch.where(
@@ -739,15 +823,21 @@ def evaluate_gsm8k(model, tokenizer, samples, strength=0.0, use_random_features=
                 teacher_sae,
             )
 
+        # Store for hook
         grafting_context["teacher_features"] = teacher_sae
         grafting_context["strength"] = strength
 
-        # Debug once if you want
-        if grafting_context.get("debug_once_eval", True):
-            print("[grafting eval] teacher_sae norm (mean):", norms.mean().item())
-            grafting_context["debug_once_eval"] = False
+        # One-time debug if you want:
+        if grafting_context.get("debug_once", True):
+            print(
+                "[grafting] teacher_sae norm (mean):",
+                norms.mean().item(),
+            )
+            grafting_context["debug_once"] = False
 
+        # -----------------------------
         # Run base model with graft
+        # -----------------------------
         with torch.no_grad():
             generated_ids = model.generate(
                 **inputs,
@@ -772,11 +862,12 @@ def evaluate_gsm8k(model, tokenizer, samples, strength=0.0, use_random_features=
                 correct += 1
             total += 1
 
-    eval_hook_handle.remove()
+    hook_handle.remove()
     accuracy = correct / total if total > 0 else 0.0
-    print(f"-> Strength {strength} ({'RANDOM' if use_random_features else 'REASONING'}): "
-          f"Accuracy = {accuracy:.3f} ({correct}/{total})")
+    print(f"-> Strength {strength}: Accuracy = {accuracy:.3f} ({correct}/{total})")
     return accuracy
+
+
 
 # ================================
 # GSM8K DATA & FEATURE IDENTIFICATION
@@ -802,22 +893,12 @@ feature_id_samples = list(gsm8k_train.select(range(GSM8K_FEATURE_SAMPLES)))
 # Load / resume grafting checkpoint
 reasoning_features_dict = {}
 results_by_strength = {}
-results_by_strength_random = {}   # [REVISION(4)] random control
 if os.path.exists(CHECKPOINT_FILE):
     print(f"\nFound results checkpoint at '{CHECKPOINT_FILE}'. Loading progress...")
     with open(CHECKPOINT_FILE, "r") as f:
         checkpoint_data = json.load(f)
-    reasoning_features_dict = {
-        int(k): v for k, v in checkpoint_data.get("reasoning_features_dict", {}).items()
-    }
-    results_by_strength = {
-        float(k): v for k, v in checkpoint_data.get("results_by_strength", {}).items()
-    }
-    # support older checkpoints that lack random results
-    if "results_by_strength_random" in checkpoint_data:
-        results_by_strength_random = {
-            float(k): v for k, v in checkpoint_data.get("results_by_strength_random", {}).items()
-        }
+    reasoning_features_dict = {int(k): v for k, v in checkpoint_data.get("reasoning_features_dict", {}).items()}
+    results_by_strength = {float(k): v for k, v in checkpoint_data.get("results_by_strength", {}).items()}
     print("Progress loaded.")
 
 # Identify reasoning features from 2B-IT if needed
@@ -837,7 +918,6 @@ if not reasoning_features_dict:
             {
                 "reasoning_features_dict": reasoning_features_dict,
                 "results_by_strength": results_by_strength,
-                "results_by_strength_random": results_by_strength_random,
             },
             f,
             indent=2,
@@ -849,6 +929,7 @@ else:
     print("=" * 60)
 
 grafting_context["reasoning_features_dict"] = reasoning_features_dict
+target_layer = model_a.model.layers[STITCH_LAYER_A]
 
 print("\n" + "=" * 60)
 print("Evaluating feature grafting (2B-IT → 2B base) with dynamic teacher features")
@@ -860,20 +941,13 @@ if not strengths_to_run:
     print("All evaluation strengths are already complete and loaded from checkpoint.")
 else:
     for strength in strengths_to_run:
-        acc_sel = evaluate_gsm8k(model_a, tokenizer, evaluation_samples, strength=strength,
-                                 use_random_features=False)
-        acc_rand = evaluate_gsm8k(model_a, tokenizer, evaluation_samples, strength=strength,
-                                  use_random_features=True)  # [REVISION(4)]
-
-        results_by_strength[strength] = acc_sel
-        results_by_strength_random[strength] = acc_rand
-
+        acc = evaluate_gsm8k(model_a, tokenizer, evaluation_samples, strength=strength)
+        results_by_strength[strength] = acc
         with open(CHECKPOINT_FILE, "w") as f:
             json.dump(
                 {
                     "reasoning_features_dict": reasoning_features_dict,
                     "results_by_strength": results_by_strength,
-                    "results_by_strength_random": results_by_strength_random,
                 },
                 f,
                 indent=2,
@@ -881,69 +955,84 @@ else:
         print(f"Completed and saved progress for strength {strength}.")
 
 print("\n" + "=" * 60)
-print("Analyzing grafting results (selected vs random features) [REVISION(4)]")
+print("Analyzing grafting results")
 print("=" * 60)
 
 baseline_accuracy = results_by_strength.get(0.0, 0.0)
-baseline_random = results_by_strength_random.get(0.0, 0.0)
 strengths = sorted(results_by_strength.keys())
-accuracies_sel = [results_by_strength[s] for s in strengths]
-accuracies_rand = [results_by_strength_random.get(s, 0.0) for s in strengths]
+accuracies = [results_by_strength[s] for s in strengths]
 
 plt.figure(figsize=(12, 7))
-plt.plot(strengths, accuracies_sel, "o-", linewidth=2, markersize=8, label="Selected features")
-plt.plot(strengths, accuracies_rand, "s--", linewidth=2, markersize=6, label="Random features")
+plt.plot(strengths, accuracies, "o-", linewidth=2, markersize=8)
 plt.xlabel("Grafting Strength (Additive Factor)")
 plt.ylabel("GSM8K Accuracy")
-plt.title("Offline Targeted Feature Grafting: Selected vs Random Features")
+plt.title("Offline Targeted Feature Grafting (2B-IT → 2B base, dynamic teacher features)")
 plt.grid(True, alpha=0.3)
 plt.axhline(
     y=baseline_accuracy,
     linestyle="--",
-    label=f"Baseline (2B, selected) at 0.0: {baseline_accuracy:.3f}",
+    label=f"Baseline (strength 0.0): {baseline_accuracy:.3f}",
 )
-plt.axhline(
-    y=baseline_random,
-    linestyle=":",
-    label=f"Baseline (2B, random) at 0.0: {baseline_random:.3f}",
-)
-if len(accuracies_sel) > 1:
-    best_accuracy = max(accuracies_sel)
-    best_strength = strengths[int(np.argmax(accuracies_sel))]
+if len(accuracies) > 1:
+    best_accuracy = max(accuracies)
+    best_strength = strengths[int(np.argmax(accuracies))]
     plt.axvline(
         x=best_strength,
         linestyle="--",
         alpha=0.7,
-        label=f"Best selected: {best_strength} ({best_accuracy:.3f})",
+        label=f"Best: {best_strength} ({best_accuracy:.3f})",
     )
 plt.legend()
 plt.tight_layout()
-plt.savefig("gsm8k_offline_grafting_results_selected_vs_random.png", dpi=150)
+plt.savefig("gsm8k_offline_grafting_results_2b_2bit_dynamic.png", dpi=150)
 plt.show()
 
-print("\nSummary (Selected vs Random)")
-for strength in strengths:
-    acc_sel = results_by_strength[strength]
-    acc_rand = results_by_strength_random.get(strength, 0.0)
-    improvement_sel = (
-        ((acc_sel - baseline_accuracy) / baseline_accuracy * 100)
+print("\nSummary")
+for strength in sorted(results_by_strength.keys()):
+    accuracy = results_by_strength[strength]
+    improvement = (
+        ((accuracy - baseline_accuracy) / baseline_accuracy * 100)
         if baseline_accuracy > 0
         else float("inf")
     )
-    improvement_rand = (
-        ((acc_rand - baseline_random) / baseline_random * 100)
-        if baseline_random > 0
-        else float("inf")
-    )
     print(
-        f"Strength {strength:3.2f}: "
-        f"Selected = {acc_sel:.3f} ({improvement_sel:+.2f}%) | "
-        f"Random = {acc_rand:.3f} ({improvement_rand:+.2f}%)"
+        f"Strength {strength:3.2f}: Accuracy = {accuracy:.3f}  |  Improvement = {improvement:+.2f}%"
     )
+
+new_strengths = strengths
+new_accuracies = accuracies
+
+plt.figure(figsize=(10, 6))
+plt.plot(np.array(new_strengths), np.array(new_accuracies) * len(evaluation_samples),
+         "o-", linewidth=2, markersize=8)
+plt.xlabel("Grafting Strength")
+plt.ylabel(f"GSM8K Questions Answered Correctly (out of {len(evaluation_samples)})")
+plt.title("Feature Grafting Performance vs. Grafting Strength (2B-IT → 2B base, dynamic)")
+plt.grid(True, alpha=0.3)
+plt.axhline(
+    y=new_accuracies[0] * len(evaluation_samples),
+    linestyle="--",
+    label=f"Baseline (2B): {new_accuracies[0] * len(evaluation_samples):.0f}",
+)
+
+best_strength = new_strengths[int(np.argmax(new_accuracies))]
+best_accuracy = max(new_accuracies)
+plt.axvline(
+    x=best_strength,
+    linestyle="--",
+    alpha=0.7,
+    label=f"Best: {best_strength} ({best_accuracy * len(evaluation_samples):.0f})",
+)
+plt.legend()
+plt.tight_layout()
+plt.savefig("gsm8k_feature_grafting_results_2b_2bit_dynamic.png", dpi=150, bbox_inches="tight")
+plt.show()
+
 
 # ============================================
 # BASELINE EVALUATION: 2B base vs 2B-IT (no grafting)
 # ============================================
+
 def evaluate_gsm8k_plain(model, tokenizer, samples, tag="",
                          max_new_tokens=MAX_NEW_TOKENS,
                          batch_size=EVAL_BATCH_SIZE):
@@ -1001,6 +1090,8 @@ def evaluate_gsm8k_plain(model, tokenizer, samples, tag="",
     print(f"[BASELINE] {tag}: Accuracy = {accuracy:.3f} ({correct}/{total})")
     return accuracy
 
+
+# Run baselines for both models
 baseline_2b_base = evaluate_gsm8k_plain(
     model_a, tokenizer, evaluation_samples, tag="Gemma 2B base"
 )
@@ -1012,9 +1103,13 @@ print("\n===== BASELINE SUMMARY (NO GRAFTING) =====")
 print(f"Gemma 2B base accuracy:      {baseline_2b_base:.3f}")
 print(f"Gemma 2B-IT (teacher) acc.:  {baseline_2b_it:.3f}")
 
-print("\nComparison vs grafting runs (selected features):")
-print("Strength | Accuracy | Δ vs plain 2B base")
-for s in sorted(results_by_strength.keys()):
-    acc = results_by_strength[s]
-    delta = acc - baseline_2b_base
-    print(f"{s:7.3f} | {acc:8.3f} | {delta:+.3f}")
+# Optional: compare to your grafting results dict if it exists
+try:
+    print("\nComparison vs grafting runs (if results_by_strength exists):")
+    print("Strength | Accuracy | Δ vs plain 2B base")
+    for s in sorted(results_by_strength.keys()):
+        acc = results_by_strength[s]
+        delta = acc - baseline_2b_base
+        print(f"{s:7.3f} | {acc:8.3f} | {delta:+.3f}")
+except NameError:
+    pass
